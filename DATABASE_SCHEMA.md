@@ -1,507 +1,511 @@
-# AgencyPulse — Database Schema (PostgreSQL)
+# AgencyPulse — PostgreSQL Database Schema
 
-## Overview
+## Conventions
 
-This document defines the complete PostgreSQL schema for AgencyPulse, including all tables, relationships, indexes, Row Level Security (RLS) policies, and seed data.
+- All timestamps use `timestamptz`.
+- All monetary values use `numeric(12,2)`.
+- UUIDs are generated with `gen_random_uuid()`.
+- `created_at` / `updated_at` follow the `created_at DEFAULT now()` / `updated_at DEFAULT now()` pattern and are maintained by triggers.
 
 ---
 
-## 1. Table Definitions
+## Extension Setup
 
-### 1.1 `agencies`
+```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+```
 
-The top-level tenant. Each agency owns clients, reports, templates, and subscriptions.
+---
+
+## Table Definitions
+
+### 1. agencies
+
+Top-level tenant. Every other row belongs to one agency.
+
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | `gen_random_uuid()` |
+| name | varchar(255) NOT NULL | |
+| slug | varchar(100) UNIQUE NOT NULL | URL-safe identifier |
+| api_key | varchar(255) UNIQUE NOT NULL | Hashed API key |
+| settings | jsonb DEFAULT '{}' | Branding, defaults |
+| plan | varchar(50) DEFAULT 'free' | free, pro, enterprise |
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
 
 ```sql
 CREATE TABLE agencies (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- name TEXT NOT NULL,
- email TEXT NOT NULL UNIQUE,
- plan TEXT NOT NULL DEFAULT 'starter' CHECK (plan IN ('starter', 'growth', 'enterprise')),
- white_label_config JSONB DEFAULT '{}'::jsonb,
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
- -- soft-delete friendly
- deleted_at TIMESTAMPTZ
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ name varchar(255) NOT NULL,
+ slug varchar(100) UNIQUE NOT NULL,
+ api_key varchar(255) UNIQUE NOT NULL,
+ settings jsonb DEFAULT '{}',
+ plan varchar(50) DEFAULT 'free',
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now()
 );
-
-COMMENT ON TABLE agencies IS 'Agency tenants – the root entity in the multi-tenant hierarchy.';
-COMMENT ON COLUMN agencies.white_label_config IS '{"logo_url": "...", "primary_color": "#...", "custom_domain": "..."}';
 ```
 
-### 1.2 `clients`
+---
 
-Clients belong to one agency.
+### 2. clients
+
+An agency's end-clients — the businesses receiving reports.
+
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| agency_id | uuid REFERENCES agencies(id) ON DELETE CASCADE | |
+| name | varchar(255) NOT NULL | |
+| industry | varchar(100) | |
+| website | varchar(500) | |
+| contact_email | varchar(255) | |
+| contact_name | varchar(255) | |
+| settings | jsonb DEFAULT '{}' | Client-specific overrides |
+| is_active | boolean DEFAULT true | |
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
 
 ```sql
 CREATE TABLE clients (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- agency_id UUID NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
- name TEXT NOT NULL,
- email TEXT NOT NULL,
- company TEXT NOT NULL,
- contact_person TEXT NOT NULL,
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- deleted_at TIMESTAMPTZ,
-
- UNIQUE (agency_id, email)
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ agency_id uuid NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+ name varchar(255) NOT NULL,
+ industry varchar(100),
+ website varchar(500),
+ contact_email varchar(255),
+ contact_name varchar(255),
+ settings jsonb DEFAULT '{}',
+ is_active boolean DEFAULT true,
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now()
 );
-
-CREATE INDEX idx_clients_agency_id ON clients(agency_id);
 ```
 
-### 1.3 `integrations`
+---
 
-One row per platform integration per client. A client may have multiple rows (one per platform).
+### 3. integrations
+
+Connects external marketing tools (Google Analytics, Facebook Ads, Google Ads, HubSpot, Shopify, etc.) to a client.
+
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| client_id | uuid REFERENCES clients(id) ON DELETE CASCADE | |
+| platform | varchar(50) NOT NULL | google_analytics, facebook, google_ads, hubspot, shopify, custom |
+| name | varchar(255) NOT NULL | User-facing label |
+| credentials | jsonb NOT NULL | Encrypted access/refresh tokens |
+| status | varchar(50) DEFAULT 'active' | active, error, expired |
+| last_synced_at | timestamptz | |
+| error_message | text | |
+| metadata | jsonb DEFAULT '{}' | Account IDs, property IDs, etc. |
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
 
 ```sql
 CREATE TABLE integrations (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
- platform TEXT NOT NULL CHECK (platform IN ('google_ads', 'meta', 'ga4', 'linkedin', 'tiktok')),
- access_token TEXT NOT NULL,
- refresh_token TEXT,
- status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'expired', 'revoked', 'error')),
- connected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- last_synced_at TIMESTAMPTZ,
- error_message TEXT,
- expires_at TIMESTAMPTZ,
-
- UNIQUE (client_id, platform)
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ client_id uuid NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+ platform varchar(50) NOT NULL CHECK (platform IN (
+ 'google_analytics','facebook','google_ads','hubspot','shopify','custom')),
+ name varchar(255) NOT NULL,
+ credentials jsonb NOT NULL,
+ status varchar(50) DEFAULT 'active',
+ last_synced_at timestamptz,
+ error_message text,
+ metadata jsonb DEFAULT '{}',
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now()
 );
-
-CREATE INDEX idx_integrations_client_id ON integrations(client_id);
-CREATE INDEX idx_integrations_status ON integrations(status) WHERE deleted_at IS NULL;
 ```
 
-### 1.4 `reports`
+---
 
-Generated reports. Each report is scoped to one client and one agency.
+### 4. metrics
 
-```sql
-CREATE TABLE reports (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
- agency_id UUID NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
- report_type TEXT NOT NULL DEFAULT 'monthly' CHECK (report_type IN ('weekly', 'monthly', 'quarterly', 'custom')),
- period_start DATE NOT NULL,
- period_end DATE NOT NULL,
- data JSONB DEFAULT '{}'::jsonb,
- pdf_url TEXT,
- narrative_text TEXT,
- status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'generating', 'ready', 'sent', 'failed')),
- sent_at TIMESTAMPTZ,
- sent_to TEXT[] DEFAULT '{}',
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- created_by UUID REFERENCES agencies(id),
+Time-series data fetched from integrations. Each row is one metric observation for one client/platform.
 
- CONSTRAINT valid_period CHECK (period_end >= period_start)
-);
-
-CREATE INDEX idx_reports_client_id ON reports(client_id);
-CREATE INDEX idx_reports_agency_id ON reports(agency_id);
-CREATE INDEX idx_reports_status ON reports(status);
-CREATE INDEX idx_reports_created_at ON reports(created_at DESC);
-CREATE INDEX idx_reports_period ON reports(period_start, period_end);
-```
-
-### 1.5 `metrics`
-
-Time-series performance data pulled from integrations.
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| client_id | uuid REFERENCES clients(id) ON DELETE CASCADE | |
+| integration_id | uuid REFERENCES integrations(id) ON DELETE CASCADE | |
+| metric_type | varchar(100) NOT NULL | e.g. sessions, impressions, spend |
+| metric_value | numeric(14,4) NOT NULL | |
+| dimensions | jsonb DEFAULT '{}' | e.g. {"campaign": "..."} |
+| period_start | date NOT NULL | Start of the aggregation window |
+| period_end | date NOT NULL | End of the aggregation window |
+| created_at | timestamptz DEFAULT now() | |
 
 ```sql
 CREATE TABLE metrics (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
- platform TEXT NOT NULL CHECK (platform IN ('google_ads', 'meta', 'ga4', 'linkedin', 'tiktok')),
- metric_name TEXT NOT NULL, -- e.g. 'impressions', 'clicks', 'conversions', 'revenue', 'spend'
- value NUMERIC(18,4) NOT NULL,
- date DATE NOT NULL,
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
- UNIQUE (client_id, platform, metric_name, date)
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ client_id uuid NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+ integration_id uuid REFERENCES integrations(id) ON DELETE CASCADE,
+ metric_type varchar(100) NOT NULL,
+ metric_value numeric(14,4) NOT NULL,
+ dimensions jsonb DEFAULT '{}',
+ period_start date NOT NULL,
+ period_end date NOT NULL,
+ created_at timestamptz DEFAULT now()
 );
-
-CREATE INDEX idx_metrics_client_date ON metrics(client_id, date DESC);
-CREATE INDEX idx_metrics_platform_date ON metrics(platform, date DESC);
-CREATE INDEX idx_metrics_metric_name ON metrics(metric_name);
 ```
 
-### 1.6 `report_templates`
+---
 
-Reusable report structure definitions owned by an agency.
+### 5. report_templates
+
+Reusable report layouts owned by an agency.
+
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| agency_id | uuid REFERENCES agencies(id) ON DELETE CASCADE | |
+| name | varchar(255) NOT NULL | |
+| description | text | |
+| sections | jsonb NOT NULL | Ordered list of sections |
+| style_config | jsonb DEFAULT '{}' | Colors, fonts, logos |
+| is_default | boolean DEFAULT false | |
+| created_by | uuid | References users(id) if added later|
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
 
 ```sql
 CREATE TABLE report_templates (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- agency_id UUID NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
- name TEXT NOT NULL,
- description TEXT,
- sections JSONB NOT NULL DEFAULT '[]'::jsonb,
- branding JSONB DEFAULT '{}'::jsonb,
- is_default BOOLEAN NOT NULL DEFAULT false,
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ agency_id uuid NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+ name varchar(255) NOT NULL,
+ description text,
+ sections jsonb NOT NULL,
+ style_config jsonb DEFAULT '{}',
+ is_default boolean DEFAULT false,
+ created_by uuid,
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now()
 );
-
-CREATE INDEX idx_report_templates_agency_id ON report_templates(agency_id);
 ```
 
-**`sections` JSONB structure:**
-
+`sections` example:
 ```json
 [
  {
- "id": "exec_summary",
+ "id": "executive_summary",
  "title": "Executive Summary",
  "order": 1,
- "visible": true,
- "metrics": ["spend", "impressions", "clicks", "conversions"],
- "narrative_prompt": "Summarize the overall performance..."
+ "enabled": true,
+ "config": {
+ "include_narrative": true,
+ "include_highlight": true
+ }
  },
  {
  "id": "platform_breakdown",
- "title": "Platform Breakdown",
+ "title": "Platform Performance",
  "order": 2,
- "visible": true,
- "platforms": ["google_ads", "meta"],
- "charts": ["bar", "line"]
+ "enabled": true,
+ "platforms": ["google_analytics", "facebook", "google_ads"],
+ "metrics": ["sessions", "impressions", "spend", "roas"]
  }
 ]
 ```
 
-**`branding` JSONB structure:**
+---
 
-```json
-{
- "logo_url": "https://cdn.agencypulse.com/logos/agency-123.png",
- "primary_color": "#1a73e8",
- "secondary_color": "#34a853",
- "font_family": "Inter",
- "footer_text": "Prepared by AgencyPulse"
-}
-```
+### 6. reports
 
-### 1.7 `subscriptions`
+A generated report instance for a specific client and period.
 
-Billing record per agency.
-
-```sql
-CREATE TABLE subscriptions (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- agency_id UUID NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
- plan TEXT NOT NULL CHECK (plan IN ('starter', 'growth', 'enterprise')),
- status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'past_due', 'canceled', 'incomplete')),
- current_period_start TIMESTAMPTZ NOT NULL,
- current_period_end TIMESTAMPTZ NOT NULL,
- cancel_at_period_end BOOLEAN NOT NULL DEFAULT false,
- stripe_customer_id TEXT UNIQUE,
- stripe_subscription_id TEXT UNIQUE,
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_subscriptions_agency_id ON subscriptions(agency_id);
-CREATE INDEX idx_subscriptions_status ON subscriptions(status);
-```
-
-### 1.8 `scheduled_reports`
-
-Automated report generation schedule.
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| agency_id | uuid REFERENCES agencies(id) ON DELETE CASCADE | |
+| client_id | uuid REFERENCES clients(id) ON DELETE CASCADE | |
+| template_id | uuid REFERENCES report_templates(id) | nullable — ad-hoc reports |
+| title | varchar(500) NOT NULL | Overrides template name |
+| status | varchar(50) DEFAULT 'draft' | draft, generating, completed, failed, sent |
+| period_start | date NOT NULL | |
+| period_end | date NOT NULL | |
+| sections | jsonb DEFAULT '[]' | Snapshot of enabled sections |
+| style_config | jsonb DEFAULT '{}' | Snapshot of styling |
+| narrative | text | AI-generated narrative |
+| metrics_snapshot | jsonb DEFAULT '{}' | Cached metric values at generation time |
+| pdf_url | varchar | S3 / storage path |
+| pdf_size_kb | integer | |
+| created_by | uuid | |
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
+| sent_at | timestamptz | |
 
 ```sql
-CREATE TABLE scheduled_reports (
- id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
- client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
- frequency TEXT NOT NULL CHECK (frequency IN ('weekly', 'monthly', 'quarterly')),
- day_of_week INTEGER CHECK (day_of_week BETWEEN 0 AND 6), -- 0=Sunday (for weekly)
- day_of_month INTEGER CHECK (day_of_month BETWEEN 1 AND 31), -- for monthly/quarterly
- next_run_at TIMESTAMPTZ NOT NULL,
- last_run_at TIMESTAMPTZ,
- status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'error')),
- error_message TEXT,
- recipient_emails TEXT[] DEFAULT '{}',
- created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE reports (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ agency_id uuid NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+ client_id uuid NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+ template_id uuid REFERENCES report_templates(id),
+ title varchar(500) NOT NULL,
+ status varchar(50) DEFAULT 'draft',
+ period_start date NOT NULL,
+ period_end date NOT NULL,
+ sections jsonb DEFAULT '[]',
+ style_config jsonb DEFAULT '{}',
+ narrative text,
+ metrics_snapshot jsonb DEFAULT '{}',
+ pdf_url varchar,
+ pdf_size_kb integer,
+ created_by uuid,
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now(),
+ sent_at timestamptz
 );
-
-CREATE INDEX idx_scheduled_reports_next_run ON scheduled_reports(next_run_at) WHERE status = 'active';
-CREATE INDEX idx_scheduled_reports_client_id ON scheduled_reports(client_id);
 ```
 
 ---
 
-## 2. Row Level Security (RLS)
+### 7. subscriptions
 
-All multi-tenant tables enforce row-level isolation. Policies ensure agencies can only access their own data.
+Defines how often a report is generated and for which client.
 
-### 2.1 Enable RLS
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| agency_id | uuid REFERENCES agencies(id) ON DELETE CASCADE | |
+| client_id | uuid REFERENCES clients(id) ON DELETE CASCADE | |
+| template_id | uuid REFERENCES report_templates(id) | |
+| name | varchar(255) NOT NULL | e.g. "Monthly Facebook Report" |
+| frequency | varchar(50) NOT NULL | weekly, monthly, quarterly, custom |
+| frequency_days | integer | Used when frequency = custom |
+| day_of_week | integer | 1=Mon … 7=Sun, for weekly |
+| day_of_month | integer | 1-31, for monthly |
+| month_offset | integer DEFAULT 0 | For quarterly: 0, 3, 6, 9 |
+| period_days | integer DEFAULT 30 | Lookback window |
+| recipients | jsonb DEFAULT '[]' | [{"email": "...", "name": "..."}] |
+| is_active | boolean DEFAULT true | |
+| last_run_at | timestamptz | |
+| next_run_at | timestamptz | |
+| created_at | timestamptz DEFAULT now() | |
+| updated_at | timestamptz DEFAULT now() | |
 
 ```sql
+CREATE TABLE subscriptions (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ agency_id uuid NOT NULL REFERENCES agencies(id) ON DELETE CASCADE,
+ client_id uuid NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+ template_id uuid REFERENCES report_templates(id),
+ name varchar(255) NOT NULL,
+ frequency varchar(50) NOT NULL,
+ frequency_days integer,
+ day_of_week integer CHECK (day_of_week BETWEEN 1 AND 7),
+ day_of_month integer CHECK (day_of_month BETWEEN 1 AND 31),
+ month_offset integer DEFAULT 0,
+ period_days integer DEFAULT 30,
+ recipients jsonb DEFAULT '[]',
+ is_active boolean DEFAULT true,
+ last_run_at timestamptz,
+ next_run_at timestamptz,
+ created_at timestamptz DEFAULT now(),
+ updated_at timestamptz DEFAULT now()
+);
+```
+
+---
+
+### 8. scheduled_reports
+
+Execution log for each subscription run. One row per attempt.
+
+| Column | Type | Notes |
+|----------------|--------------------------|------------------------------------|
+| id | uuid PRIMARY KEY | |
+| subscription_id| uuid REFERENCES subscriptions(id) ON DELETE CASCADE | |
+| report_id | uuid REFERENCES reports(id) ON DELETE SET NULL | |
+| status | varchar(50) DEFAULT 'pending' | pending, running, completed, failed |
+| triggered_at | timestamptz DEFAULT now()| Cron trigger time |
+| started_at | timestamptz | |
+| finished_at | timestamptz | |
+| error_message | text | |
+| error_stack | text | |
+| created_at | timestamptz DEFAULT now() | |
+
+```sql
+CREATE TABLE scheduled_reports (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ subscription_id uuid NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+ report_id uuid REFERENCES reports(id) ON DELETE SET NULL,
+ status varchar(50) DEFAULT 'pending',
+ triggered_at timestamptz DEFAULT now(),
+ started_at timestamptz,
+ finished_at timestamptz,
+ error_message text,
+ error_stack text,
+ created_at timestamptz DEFAULT now()
+);
+```
+
+---
+
+## Indexes
+
+```sql
+-- Agency lookups
+CREATE UNIQUE INDEX idx_agencies_slug ON agencies(slug);
+CREATE UNIQUE INDEX idx_agencies_api_key ON agencies(api_key);
+
+-- Client list per agency
+CREATE INDEX idx_clients_agency_id ON clients(agency_id);
+
+-- Integration list per client
+CREATE INDEX idx_integrations_client_id ON integrations(client_id);
+CREATE INDEX idx_integrations_platform ON integrations(platform);
+
+-- Metrics: range queries are the hot path
+CREATE INDEX idx_metrics_client_period ON metrics(client_id, period_start, period_end);
+CREATE INDEX idx_metrics_integration ON metrics(integration_id);
+CREATE INDEX idx_metrics_type ON metrics(metric_type);
+
+-- Trigram search on metric_type for autocomplete
+CREATE INDEX idx_metrics_type_trgm ON metrics USING gin(metric_type gin_trgm_ops);
+
+-- Reports: list by agency + status
+CREATE INDEX idx_reports_agency_client ON reports(agency_id, client_id);
+CREATE INDEX idx_reports_status ON reports(status);
+CREATE INDEX idx_reports_period ON reports(period_start, period_end);
+
+-- Subscriptions: find due
+CREATE INDEX idx_subscriptions_next_run ON subscriptions(next_run_at) WHERE is_active = true;
+CREATE INDEX idx_subscriptions_agency ON subscriptions(agency_id);
+
+-- Scheduled reports: log queries
+CREATE INDEX idx_scheduled_subscription ON scheduled_reports(subscription_id);
+CREATE INDEX idx_scheduled_status ON scheduled_reports(status);
+CREATE INDEX idx_scheduled_triggered ON scheduled_reports(triggered_at);
+```
+
+---
+
+## Row Level Security (RLS)
+
+```sql
+-- Enable RLS on every table
 ALTER TABLE agencies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE integrations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE metrics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE report_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE scheduled_reports ENABLE ROW LEVEL SECURITY;
 ```
 
-### 2.2 Agency Policies
+### Agencies — every authenticated user can read their own agency
 
 ```sql
--- Agencies: users see their own agency row
-CREATE POLICY agency_self ON agencies
+CREATE POLICY agency_auth ON agencies
  FOR ALL
  TO authenticated
- USING (id = (SELECT agency_id FROM users WHERE id = auth.uid()));
-
--- Clients: filter by the user's agency
-CREATE POLICY clients_by_agency ON clients
- FOR ALL
- TO authenticated
- USING (agency_id = (SELECT agency_id FROM users WHERE id = auth.uid()));
-
--- Integrations: scoped via clients belonging to the agency
-CREATE POLICY integrations_by_agency ON integrations
- FOR ALL
- TO authenticated
- USING (
- client_id IN (
- SELECT id FROM clients WHERE agency_id = (SELECT agency_id FROM users WHERE id = auth.uid())
- )
- );
-
--- Reports: scoped by agency_id
-CREATE POLICY reports_by_agency ON reports
- FOR ALL
- TO authenticated
- USING (agency_id = (SELECT agency_id FROM users WHERE id = auth.uid()));
-
--- Metrics: scoped via clients belonging to the agency
-CREATE POLICY metrics_by_agency ON metrics
- FOR ALL
- TO authenticated
- USING (
- client_id IN (
- SELECT id FROM clients WHERE agency_id = (SELECT agency_id FROM users WHERE id = auth.uid())
- )
- );
-
--- Report Templates: scoped by agency
-CREATE POLICY templates_by_agency ON report_templates
- FOR ALL
- TO authenticated
- USING (agency_id = (SELECT agency_id FROM users WHERE id = auth.uid()));
-
--- Subscriptions: scoped by agency
-CREATE POLICY subscriptions_by_agency ON subscriptions
- FOR ALL
- TO authenticated
- USING (agency_id = (SELECT agency_id FROM users WHERE id = auth.uid()));
-
--- Scheduled Reports: scoped via clients belonging to the agency
-CREATE POLICY scheduled_reports_by_agency ON scheduled_reports
- FOR ALL
- TO authenticated
- USING (
- client_id IN (
- SELECT id FROM clients WHERE agency_id = (SELECT agency_id FROM users WHERE id = auth.uid())
- )
- );
+ USING (id = (
+ SELECT agency_id FROM agency_users
+ WHERE user_id = auth.uid()
+ ));
 ```
 
-> **Note:** The `users` table referenced above is managed by Supabase Auth. The `agency_id` column is set on the user profile row during signup.
-
----
-
-## 3. Indexes (Full List)
+### Clients — agency-scoped
 
 ```sql
--- clients
-CREATE INDEX idx_clients_agency_id ON clients(agency_id);
-
--- integrations
-CREATE INDEX idx_integrations_client_id ON integrations(client_id);
-CREATE INDEX idx_integrations_status ON integrations(status) WHERE deleted_at IS NULL;
-
--- reports
-CREATE INDEX idx_reports_client_id ON reports(client_id);
-CREATE INDEX idx_reports_agency_id ON reports(agency_id);
-CREATE INDEX idx_reports_status ON reports(status);
-CREATE INDEX idx_reports_created_at_desc ON reports(created_at DESC);
-CREATE INDEX idx_reports_period ON reports(period_start, period_end);
-CREATE INDEX idx_reports_agency_period ON reports(agency_id, period_start DESC);
-
--- metrics (composite for common queries)
-CREATE INDEX idx_metrics_client_date ON metrics(client_id, date DESC);
-CREATE INDEX idx_metrics_platform_date ON metrics(platform, date DESC);
-CREATE INDEX idx_metrics_metric_name ON metrics(metric_name);
-
--- report_templates
-CREATE INDEX idx_report_templates_agency_id ON report_templates(agency_id);
-
--- subscriptions
-CREATE INDEX idx_subscriptions_agency_id ON subscriptions(agency_id);
-CREATE INDEX idx_subscriptions_status ON subscriptions(status);
-
--- scheduled_reports
-CREATE INDEX idx_scheduled_reports_next_run ON scheduled_reports(next_run_at) WHERE status = 'active';
-CREATE INDEX idx_scheduled_reports_client_id ON scheduled_reports(client_id);
+CREATE POLICY client_isolation ON clients
+ FOR ALL
+ TO authenticated
+ USING (agency_id = (
+ SELECT agency_id FROM agency_users
+ WHERE user_id = auth.uid()
+ ));
 ```
 
----
-
-## 4. Seed Data (Sample)
+### Integrations — client-scoped
 
 ```sql
--- ── Agencies ──────────────────────────────────────────────
-INSERT INTO agencies (id, name, email, plan, white_label_config) VALUES
-(
- 'a1111111-1111-1111-1111-111111111111',
- 'BrightWave Media',
- 'hello@brightwave.agency',
- 'growth',
- '{"logo_url":"https://cdn.agencypulse.com/logos/bw.png","primary_color":"#6C5CE7","custom_domain":"reports.brightwave.agency"}'::jsonb
-),
-(
- 'a2222222-2222-2222-2222-222222222222',
- 'NorthStar Digital',
- 'team@northstar.agency',
- 'enterprise',
- '{"logo_url":"https://cdn.agencypulse.com/logos/ns.png","primary_color":"#0984E3","custom_domain":"reports.northstar.agency"}'::jsonb
-);
+CREATE POLICY integration_isolation ON integrations
+ FOR ALL
+ TO authenticated
+ USING (client_id IN (
+ SELECT c.id FROM clients c
+ JOIN agency_users au ON au.agency_id = c.agency_id
+ WHERE au.user_id = auth.uid()
+ ));
+```
 
--- ── Clients ───────────────────────────────────────────────
-INSERT INTO clients (id, agency_id, name, email, company, contact_person) VALUES
--- BrightWave clients
-('c1111111-1111-1111-1111-111111111111', 'a1111111-1111-1111-1111-111111111111', 'Acme Corp', 'marketing@acme.com', 'Acme Corporation', 'Jane Doe'),
-('c2222222-2222-2222-2222-222222222222', 'a1111111-1111-1111-1111-111111111111', 'Globex', 'ads@globex.io', 'Globex Industries', 'John Smith'),
--- NorthStar clients
-('c3333333-3333-3333-3333-333333333333', 'a2222222-2222-2222-2222-222222222222', 'Initech', 'cm@initech.com', 'Initech Solutions', 'Peter Gibbons'),
-('c4444444-4444-4444-4444-444444444444', 'a2222222-2222-2222-2222-222222222222', 'Umbrella', 'finance@umbrella.co', 'Umbrella Corporation', 'Alice Wong');
+### Metrics — client-scoped read-only
 
--- ── Integrations ──────────────────────────────────────────
-INSERT INTO integrations (id, client_id, platform, access_token, refresh_token, status, connected_at, expires_at) VALUES
--- Acme Corp integrations
-('i1111111-1111-1111-1111-111111111111', 'c1111111-1111-1111-1111-111111111111', 'google_ads', 'ya29.encrypted_1', '1//encrypted_refresh_1', 'active', now(), now() + INTERVAL '1 hour'),
-('i2222222-2222-2222-2222-222222222222', 'c1111111-1111-1111-1111-111111111111', 'meta', 'EAAJ_encrypted_2', 'EAAJ_encrypted_refresh_2', 'active', now(), now() + INTERVAL '60 days'),
-('i3333333-3333-3333-3333-333333333333', 'c1111111-1111-1111-1111-111111111111', 'ga4', 'ya29.encrypted_3', '1//encrypted_refresh_3', 'active', now(), now() + INTERVAL '1 hour'),
--- Globex integrations
-('i4444444-4444-4444-4444-444444444444', 'c2222222-2222-2222-2222-222222222222', 'google_ads', 'ya29.encrypted_4', '1//encrypted_refresh_4', 'active', now(), now() + INTERVAL '1 hour'),
--- Initech integrations
-('i5555555-5555-5555-5555-555555555555', 'c3333333-3333-3333-3333-333333333333', 'linkedin', 'AQX_encrypted_5', 'AQX_encrypted_refresh_5', 'active', now(), now() + INTERVAL '60 days'),
-('i6666666-6666-6666-6666-666666666666', 'c3333333-3333-3333-3333-333333333333', 'tiktok', 'act_encrypted_6', 'act_encrypted_refresh_6', 'active', now(), now() + INTERVAL '60 days');
+```sql
+CREATE POLICY metric_read_isolation ON metrics
+ FOR SELECT
+ TO authenticated
+ USING (client_id IN (
+ SELECT c.id FROM clients c
+ JOIN agency_users au ON au.agency_id = c.agency_id
+ WHERE au.user_id = auth.uid()
+ ));
 
--- ── Metrics (sample time-series data) ─────────────────────
-INSERT INTO metrics (client_id, platform, metric_name, value, date) VALUES
--- Acme Corp – Google Ads (last 30 days)
-('c1111111-1111-1111-1111-111111111111', 'google_ads', 'impressions', 45230, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'clicks', 1820, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'conversions', 87, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'spend', 4250.50, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'impressions', 51200, '2026-08-02'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'clicks', 2100, '2026-08-02'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'conversions', 102, '2026-08-02'),
-('c1111111-1111-1111-1111-1111-111111111111', 'google_ads', 'spend', 4890.00, '2026-08-02'),
--- Acme Corp – Meta
-('c1111111-1111-1111-1111-111111111111', 'meta', 'impressions', 128000, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'meta', 'clicks', 5400, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'meta', 'conversions', 245, '2026-08-01'),
-('c1111111-1111-1111-1111-1111-111111111111', 'meta', 'spend', 6100.75, '2026-08-01'),
--- Initech – LinkedIn
-('c3333333-3333-3333-3333-333333333333', 'linkedin', 'impressions', 89000, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'linkedin', 'clicks', 2100, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'linkedin', 'conversions', 56, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'linkedin', 'spend', 3200.00,'2026-08-01'),
--- Initech – TikTok
-('c3333333-3333-3333-3333-333333333333', 'tiktok', 'impressions', 250000, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'tiktok', 'clicks', 7800, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'tiktok', 'conversions', 190, '2026-08-01'),
-('c3333333-3333-3333-3333-333333333333', 'tiktok', 'spend', 5500.25,'2026-08-01');
+CREATE POLICY metric_write_service ON metrics
+ FOR INSERT
+ TO service_role
+ WITH CHECK (true);
+```
 
--- ── Report Templates ──────────────────────────────────────
-INSERT INTO report_templates (id, agency_id, name, description, sections, branding, is_default) VALUES
-(
- 't1111111-1111-1111-1111-111111111111',
- 'a1111111-1111-1111-1111-111111111111',
- 'Monthly Performance',
- 'Standard monthly performance report with all key metrics.',
- '[
- {"id":"exec_summary","title":"Executive Summary","order":1,"visible":true,"metrics":["spend","impressions","clicks","conversions"],"narrative_prompt":"Provide an executive summary of this month performance."},
- {"id":"platform_breakdown","title":"Platform Breakdown","order":2,"visible":true,"platforms":["google_ads","meta","ga4"],"charts":["bar","line"]},
- {"id":"key_insights","title":"Key Insights & Recommendations","order":3,"visible":true,"narrative_prompt":"Highlight the top 3 insights and provide actionable recommendations."}
- ]'::jsonb,
- '{"logo_url":"https://cdn.agencypulse.com/logos/bw.png","primary_color":"#6C5CE7","font_family":"Inter"}'::jsonb,
- true
-),
-(
- 't2222222-2222-2222-2222-222222222222',
- 'a2222222-2222-2222-2222-222222222222',
- 'B2B Lead Generation',
- 'Focused on lead gen metrics across LinkedIn and Meta.',
- '[
- {"id":"exec_summary","title":"Executive Summary","order":1,"visible":true,"metrics":["spend","conversions","cpl"],"narrative_prompt":"Summarize lead generation performance."},
- {"id":"platform_breakdown","title":"Platform Breakdown","order":2,"visible":true,"platforms":["linkedin","meta"],"charts":["bar"]},
- {"id":"funnel","title":"Conversion Funnel","order":3,"visible":true,"metrics":["impressions","clicks","conversions"]}
- ]'::jsonb,
- '{"logo_url":"https://cdn.agencypulse.com/logos/ns.png","primary_color":"#0984E3","font_family":"Inter"}'::jsonb,
- true
-);
+### Report templates — agency-scoped
 
--- ── Subscriptions ─────────────────────────────────────────
-INSERT INTO subscriptions (agency_id, plan, status, current_period_start, current_period_end, stripe_customer_id, stripe_subscription_id) VALUES
-('a1111111-1111-1111-1111-111111111111', 'growth', 'active', '2026-08-01', '2026-09-01', 'cus_BW001', 'sub_BW001'),
-('a2222222-2222-2222-2222-222222222222', 'enterprise','active', '2026-08-15', '2026-09-15', 'cus_NS001', 'sub_NS001');
+```sql
+CREATE POLICY template_isolation ON report_templates
+ FOR ALL
+ TO authenticated
+ USING (agency_id = (
+ SELECT agency_id FROM agency_users
+ WHERE user_id = auth.uid()
+ ));
+```
 
--- ── Scheduled Reports ─────────────────────────────────────
-INSERT INTO scheduled_reports (client_id, frequency, day_of_month, next_run_at, last_run_at, status, recipient_emails) VALUES
-('c1111111-1111-1111-1111-111111111111', 'monthly', 1, '2026-10-01 08:00:00+00', '2026-09-01 08:00:00+00', 'active', ARRAY['jane@brightwave.agency', 'marketing@acme.com']),
-('c2222222-2222-2222-2222-222222222222', 'monthly', 1, '2026-10-01 08:00:00+00', '2026-09-01 08:00:00+00', 'active', ARRAY['jane@brightwave.agency', 'ads@globex.io']),
-('c3333333-3333-3333-3333-333333333333', 'weekly', NULL, '2026-09-07 08:00:00+00', '2026-08-31 08:00:00+00', 'active', ARRAY['team@northstar.agency', 'cm@initech.com']);
+### Reports — agency-scoped
 
--- ── Reports (sample generated reports) ────────────────────
-INSERT INTO reports (id, client_id, agency_id, report_type, period_start, period_end, data, status, sent_at) VALUES
-(
- 'r1111111-1111-1111-1111-111111111111',
- 'c1111111-1111-1111-1111-111111111111',
- 'a1111111-1111-1111-1111-111111111111',
- 'monthly',
- '2026-08-01', '2026-08-31',
- '{
- "summary": {"total_spend": 15141.30, "total_impressions": 504430, "total_clicks": 9320, "total_conversions": 434},
- "platforms": {
- "google_ads": {"spend": 9140.50, "impressions": 96430, "clicks": 3920, "conversions": 189},
- "meta": {"spend": 6000.75, "impressions": 128000, "clicks": 5400, "conversions": 245}
- }
- }'::jsonb,
- 'sent',
- '2026-09-01 09:15:00+00'
-),
-(
- 'r2222222-2222-2222-2222-222222222222',
- 'c3333333-3333-3333-3333-333333333333',
- 'a2222222-2222-2222-2222-222222222222',
- 'monthly',
- '2026-08-01', '2026-08-31',
- '{
- "summary": {"total_spend": 8700.25, "total_impressions": 339000, "total_clicks": 9900, "total_conversions": 246},
- "platforms": {
- "linkedin": {"spend": 3200.00, "impressions": 89000, "clicks": 2100, "conversions": 56},
- "tiktok": {"spend": 5500.25, "impressions": 250000, "clicks": 7800, "conversions": 190}
- }
- }'::jsonb,
- 'sent',
- '2026-09-01 10:00:00+00'
-);
+```sql
+CREATE POLICY report_isolation ON reports
+ FOR ALL
+ TO authenticated
+ USING (agency_id = (
+ SELECT agency_id FROM agency_users
+ WHERE user_id = auth.uid()
+ ));
+```
+
+### Subscriptions — agency-scoped
+
+```sql
+CREATE POLICY subscription_isolation ON subscriptions
+ FOR ALL
+ TO authenticated
+ USING (agency_id = (
+ SELECT agency_id FROM agency_users
+ WHERE user_id = auth.uid()
+ ));
+```
+
+### Scheduled reports — subscription-scoped (derives agency from subscription)
+
+```sql
+CREATE POLICY scheduled_report_isolation ON scheduled_reports
+ FOR ALL
+ TO authenticated
+ USING (subscription_id IN (
+ SELECT s.id FROM subscriptions s
+ JOIN agency_users au ON au.agency_id = s.agency_id
+ WHERE au.user_id = auth.uid()
+ ));
 ```
 
 ---
 
-## 5. Database Functions & Triggers
-
-### 5.1 Auto-update `updated_at`
+## Updated-at Trigger (shared)
 
 ```sql
 CREATE OR REPLACE FUNCTION set_updated_at()
@@ -512,56 +516,210 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_report_templates_updated_at
- BEFORE UPDATE ON report_templates
- FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
-CREATE TRIGGER trg_subscriptions_updated_at
- BEFORE UPDATE ON subscriptions
- FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
-CREATE TRIGGER trg_scheduled_reports_updated_at
- BEFORE UPDATE ON scheduled_reports
- FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_agencies_updated BEFORE UPDATE ON agencies FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_clients_updated BEFORE UPDATE ON clients FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_integrations_updated BEFORE UPDATE ON integrations FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_templates_updated BEFORE UPDATE ON report_templates FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_reports_updated BEFORE UPDATE ON reports FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER trg_subscriptions_updated BEFORE UPDATE ON subscriptions FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
-### 5.2 Update `last_synced_at` on metrics insert
+---
+
+## Seed Data
 
 ```sql
-CREATE OR REPLACE FUNCTION touch_integration_sync()
-RETURNS TRIGGER AS $$
-BEGIN
- UPDATE integrations
- SET last_synced_at = now()
- WHERE id = (SELECT integration_id FROM metric_sync_jobs WHERE metric_id = NEW.id);
- RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+-- ── Agency ─────────────────────────────────────────────────────────────
+INSERT INTO agencies (id, name, slug, api_key, settings, plan) VALUES (
+ '00000000-0000-0000-0000-000000000001',
+ 'BrightPath Digital',
+ 'brightpath',
+ crypt('brightpath-dev-key', gen_salt('bf')),
+ '{"logo_url": "https://cdn.example.com/brightpath.png", "brand_color": "#2563eb"}',
+ 'pro'
+);
+
+-- ── Clients ────────────────────────────────────────────────────────────
+INSERT INTO clients (id, agency_id, name, industry, website, contact_email, contact_name) VALUES
+('00000000-0000-0000-0000-000000000101', '00000000-0000-0000-0000-000000000001', 'Aurora Skincare', 'Beauty & Cosmetics', 'https://auroraskincare.com', 'hello@auroraskincare.com', 'Sarah Chen'),
+('00000000-0000-0000-0000-000000000102', '00000000-0000-0000-0000-000000000001', 'PeakFit Gym', 'Fitness & Wellness', 'https://peakfitgym.com', 'info@peakfitgym.com', 'Marcus Rivera'),
+('00000000-0000-0000-0000-000000000103', '00000000-0000-0000-0000-000000000001', 'CloudVault SaaS', 'Technology / B2B SaaS', 'https://cloudvault.io', 'team@cloudvault.io', 'Priya Kapoor');
+
+-- ── Integrations ────────────────────────────────────────────────────────
+INSERT INTO integrations (id, client_id, platform, name, credentials, status, metadata) VALUES
+('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000101', 'google_analytics', 'Aurora GA4',
+ '{"property_id": "G-ABC123"}', 'active', '{"property_id": "G-ABC123", "property_name": "auroraskincare.com"}'),
+('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000101', 'facebook', 'Aurora Facebook Ads',
+ '{"ad_account_id": "act_789"}', 'active', '{"ad_account_id": "act_789"}'),
+('00000000-0000-0000-0000-000000000203', '00000000-0000-0000-0000-000000000102', 'google_ads', 'PeakFit Google Ads',
+ '{"customer_id": "1234567890"}', 'active', '{"customer_id": "1234567890"}'),
+('00000000-0000-0000-0000-000000000204', '00000000-0000-0000-0000-000000000103', 'google_analytics', 'CloudVault GA4',
+ '{"property_id": "G-XYZ789"}', 'active', '{"property_id": "G-XYZ789"}'),
+('00000000-0000-0000-0000-000000000205', '00000000-0000-0000-0000-000000000103', 'hubspot', 'CloudVault HubSpot CRM',
+ '{"portal_id": "5555555"}', 'active', '{"portal_id": "5555555"}');
+
+-- ── Sample Metrics (last 4 weeks for Aurora GA4) ────────────────────────
+INSERT INTO metrics (client_id, integration_id, metric_type, metric_value, dimensions, period_start, period_end)
+SELECT
+ '00000000-0000-0000-0000-000000000101'::uuid,
+ '00000000-0000-0000-0000-000000000201'::uuid,
+ 'sessions',
+ 50000 + (random() * 10000)::numeric(14,4),
+ '{}'::jsonb,
+ d,
+ d + INTERVAL '6 days'
+FROM generate_series(
+ CURRENT_DATE - INTERVAL '27 days',
+ CURRENT_DATE - INTERVAL '7 days',
+ '7 days'
+) AS t(d);
+
+INSERT INTO metrics (client_id, integration_id, metric_type, metric_value, dimensions, period_start, period_end)
+SELECT
+ '00000000-0000-0000-0000-000000000101'::uuid,
+ '00000000-0000-0000-0000-000000000201'::uuid,
+ 'conversions',
+ 250 + (random() * 100)::numeric(14,4),
+ '{}'::jsonb,
+ d,
+ d + INTERVAL '6 days'
+FROM generate_series(
+ CURRENT_DATE - INTERVAL '27 days',
+ CURRENT_DATE - INTERVAL '7 days',
+ '7 days'
+) AS t(d);
+
+INSERT INTO metrics (client_id, integration_id, metric_type, metric_value, dimensions, period_start, period_end)
+SELECT
+ '00000000-0000-0000-0000-000000000101'::uuid,
+ '00000000-0000-0000-0000-000000000202'::uuid,
+ 'spend',
+ 3000 + (random() * 1500)::numeric(14,4),
+ '{}'::jsonb,
+ d,
+ d + INTERVAL '6 days'
+FROM generate_series(
+ CURRENT_DATE - INTERVAL '27 days',
+ CURRENT_DATE - INTERVAL '7 days',
+ '7 days'
+) AS t(d);
+
+INSERT INTO metrics (client_id, integration_id, metric_type, metric_value, dimensions, period_start, period_end)
+SELECT
+ '00000000-0000-0000-0000-000000000102'::uuid,
+ '00000000-0000-0000-0000-000000000203'::uuid,
+ 'impressions',
+ 200000 + (random() * 50000)::numeric(14,4),
+ '{}'::jsonb,
+ d,
+ d + INTERVAL '6 days'
+FROM generate_series(
+ CURRENT_DATE - INTERVAL '27 days',
+ CURRENT_DATE - INTERVAL '7 days',
+ '7 days'
+) AS t(d);
+
+INSERT INTO metrics (client_id, integration_id, metric_type, metric_value, dimensions, period_start, period_end)
+SELECT
+ '00000000-0000-0000-0000-000000000103'::uuid,
+ '00000000-0000-0000-0000-000000000204'::uuid,
+ 'sessions',
+ 12000 + (random() * 3000)::numeric(14,4),
+ '{}'::jsonb,
+ d,
+ d + INTERVAL '6 days'
+FROM generate_series(
+ CURRENT_DATE - INTERVAL '27 days',
+ CURRENT_DATE - INTERVAL '7 days',
+ '7 days'
+) AS t(d);
+
+-- ── Report Template ──────────────────────────────────────────────────────
+INSERT INTO report_templates (id, agency_id, name, description, sections, style_config, is_default)
+VALUES (
+ '00000000-0000-0000-0000-000000000301',
+ '00000000-0000-0000-0000-000000000001',
+ 'Standard Monthly Report',
+ 'Default client report covering overview, platform breakdown, and recommendations.',
+ '[
+ {
+ "id": "executive_summary",
+ "title": "Executive Summary",
+ "order": 1,
+ "enabled": true,
+ "config": {"include_narrative": true, "include_highlight": true}
+ },
+ {
+ "id": "platform_breakdown",
+ "title": "Platform Performance",
+ "order": 2,
+ "enabled": true,
+ "platforms": ["google_analytics", "facebook", "google_ads"],
+ "metrics": ["sessions", "impressions", "spend", "roas"]
+ },
+ {
+ "id": "trends",
+ "title": "Trends & Insights",
+ "order": 3,
+ "enabled": true,
+ "config": {"show_charts": true, "periods": 2}
+ },
+ {
+ "id": "recommendations",
+ "title": "Recommendations",
+ "order": 4,
+ "enabled": true
+ }
+ ]'::jsonb,
+ '{"primary_color": "#2563eb", "font_family": "Inter", "logo_url": "https://cdn.example.com/brightpath.png"}',
+ true
+);
+
+-- ── Reports ──────────────────────────────────────────────────────────────
+INSERT INTO reports (id, agency_id, client_id, template_id, title, status, period_start, period_end, narrative, pdf_url) VALUES
+('00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000101',
+ '00000000-0000-0000-0000-000000000301', 'Aurora Skincare — August 2026 Report', 'completed',
+ '2026-08-01', '2026-08-31',
+ 'August was a strong month for Aurora Skincare. Website sessions grew 12% week-over-week, driven by an effective Instagram Reels campaign. Facebook ad spend returned a ROAS of 4.8x. Recommendation: scale the top-performing ad sets and test new creative for the back-to-school push.',
+ 'https://cdn.example.com/reports/aurora-august-2026.pdf'),
+('00000000-0000-0000-0000-000000000402', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000102',
+ '00000000-0000-0000-0000-000000000301', 'PeakFit Gym — August 2026 Report', 'completed',
+ '2026-08-01', '2026-08-31',
+ 'PeakFit maintained steady impression volume throughout August. CPC rose 8% due to increased competition. Recommendation: expand into YouTube Shorts video ads and refresh landing page copy.',
+ 'https://cdn.example.com/reports/peakfit-august-2026.pdf');
+
+-- ── Subscription ─────────────────────────────────────────────────────────
+INSERT INTO subscriptions (id, agency_id, client_id, template_id, name, frequency, day_of_month, period_days, recipients, next_run_at)
+VALUES (
+ '00000000-0000-0000-0000-000000000501',
+ '00000000-0000-0000-0000-000000000001',
+ '00000000-0000-0000-0000-000000000101',
+ '00000000-0000-0000-0000-000000000301',
+ 'Aurora Skincare — Monthly',
+ 'monthly',
+ 1,
+ 30,
+ '[{"email": "hello@auroraskincare.com", "name": "Sarah Chen"}, {"email": "team@brightpath.com", "name": "BrightPath Team"}]',
+ '2026-10-01 09:00:00+00'
+);
+
+-- ── Scheduled Report Log ────────────────────────────────────────────────
+INSERT INTO scheduled_reports (id, subscription_id, report_id, status, triggered_at, finished_at)
+VALUES (
+ '00000000-0000-0000-0000-000000000601',
+ '00000000-0000-0000-0000-000000000501',
+ '00000000-0000-0000-0000-000000000401',
+ 'completed',
+ '2026-09-01 09:00:00+00',
+ '2026-09-01 09:02:14+00'
+);
 ```
 
 ---
 
-## 6. ER Diagram (Textual)
+## Future Migration Notes
 
-```
-agencies (1) ──< (N) clients
-agencies (1) ──< (N) report_templates
-agencies (1) ──< (N) subscriptions
-agencies (1) ──< (N) reports
-clients (1) ──< (N) integrations
-clients (1) ──< (N) reports
-clients (1) ──< (N) metrics
-clients (1) ──< (N) scheduled_reports
-reports (1) ──< (N) metrics (aggregated into report.data JSONB)
-```
-
----
-
-## 7. Data Retention Policy
-
-| Table | Retention | Notes |
-|--------------------|-----------------------|----------------------------------------|
-| `metrics` | 24 months | Archive to cold storage after 24 months|
-| `reports` | Indefinite (agency) | Soft-delete after agency cancellation |
-| `integrations` | Indefinite | Revoked tokens marked `revoked` status |
-| `scheduled_reports`| Indefinite (agency) | Soft-delete with agency |
+- Add a `users` table + `agency_users` join table when multi-user support is needed.
+- Store integration `credentials` encrypted (e.g., using Supabase Vault or an external KMS).
+- Partition `metrics` by `period_start` quarter for very large datasets.
+- Add `webhooks` table (id, agency_id, url, secret, events, is_active) when outbound webhooks are implemented.
