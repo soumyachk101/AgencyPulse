@@ -1,0 +1,63 @@
+{
+ "$schema": "https://openapi.vercel.sh/vercel.json",
+ "version": 2,
+ "name": "agencypulse-frontend",
+ "framework": "nextjs",
+ "regions": ["iad1", "sfo1", "fra1"],
+
+ "build": {
+ "env": {
+ "NEXT_PUBLIC_APP_URL": "@app_url",
+ "NEXT_PUBLIC_API_URL": "@api_url"
+ }
+ },
+
+ "functions": {
+ "src/app/api/**/*.ts": {
+ "memory": 1024,
+ "maxDuration": 30
+ },
+ "src/app/api/reports/**/*.ts": {
+ "memory": 2048,
+ "maxDuration": 60
+ },
+ "src/app/api/sync/**/*.ts": {
+ "memory": 1024,
+ "maxDuration": 30
+ }
+ },
+
+ "rewrites": [
+ { "source": "/api/auth/:path*", "destination": "https://agencypulse-api.fly.dev/api/auth/:path*" },
+ { "source": "/api/reports/:path*", "destination": "https://agencypulse-api.fly.dev/api/reports/:path*" },
+ { "source": "/api/sync/:path*", "destination": "https://agencypulse-api.fly.dev/api/sync/:path*" },
+ { "source": "/api/webhooks/:path*", "destination": "https://agencypulse-api.fly.dev/api/webhooks/:path*" },
+ { "source": "/api/integrations/:path*", "destination": "https://agencypulse-api.fly.dev/api/integrations/:path*" }
+ ],
+
+ "headers": [
+ {
+ "source": "/(.*)",
+ "headers": [
+ { "key": "X-Frame-Options", "value": "DENY" },
+ { "key": "X-Content-Type-Options", "value": "nosniff" },
+ { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+ { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" }
+ ]
+ },
+ {
+ "source": "/api/(.*)",
+ "headers": [
+ { "key": "Access-Control-Allow-Origin", "value": "https://agencypulse.app" },
+ { "key": "Access-Control-Allow-Methods", "value": "GET, POST, PUT, DELETE, PATCH, OPTIONS" },
+ { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization, X-CSRF-Token" },
+ { "key": "Access-Control-Max-Age", "value": "86400" }
+ ]
+ }
+ ],
+
+ "crons": [
+ { "path": "/api/cron/sync", "schedule": "0 6 * * *" },
+ { "path": "/api/cron/reports", "schedule": "0 5 * * 1" }
+ ]
+}

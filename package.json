@@ -1,0 +1,14 @@
+{
+ "name": "agencypulse",
+ "version": "1.0.0",
+ "private": true,
+ "workspaces": [
+ "frontend",
+ "backend",
+ "shared"
+ ],
+ "scripts": {
+ "dev": "npm run dev --workspaces --if-present",
+ "build": "npm run build --workspaces --if-present"
+ }
+}

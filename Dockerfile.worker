@@ -1,0 +1,57 @@
+# ──────────────────────────────────────────────────────────────
+# AgencyPulse · Dockerfile.worker
+# Slim image for BullMQ background job processing.
+# ──────────────────────────────────────────────────────────────
+
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 make g++ libc6-compat \
+ && ln -s /usr/bin/python3 /usr/local/bin/python
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+COPY backend/package.json ./backend/
+COPY frontend/package.json ./frontend/
+COPY shared/package.json ./shared/
+RUN npm ci --prefer-offline --no-audit
+
+COPY . .
+
+# Generate Prisma client
+RUN npx prisma generate --schema=./backend/prisma/schema.prisma
+
+# Build all workspaces
+RUN npm run build
+
+# Prune dev deps
+RUN npm prune --production && npm cache clean --force
+
+# ── Runner ───────────────────────────────────────────────────
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs && \
+ adduser --system --uid 1001 nextjs
+
+# Backend compiled code + Prisma client
+COPY --from=builder --chown=nextjs:nodejs /app/backend/dist ./backend/dist
+COPY --from=builder --chown=nextjs:nodejs /app/backend/node_modules/.prisma ./backend/node_modules/.prisma
+COPY --from=builder --chown=nextjs:nodejs /app/backend/prisma ./backend/prisma
+
+# Shared workspace
+COPY --from=builder --chown=nextjs:nodejs /app/shared/dist ./shared/dist
+COPY --from=builder --chown=nextjs:nodejs /app/shared/node_modules ./shared/node_modules
+
+# Root node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+
+USER nextjs
+
+# Worker does not expose ports; it connects to Redis + Postgres internally.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+ CMD node -e "const r=require('ioredis'); const c=new r(process.env.REDIS_URL); c.ping().then(()=>process.exit(0)).catch(()=>process.exit(1))"
+
+CMD ["node", "backend/dist/queue/worker.js"]
